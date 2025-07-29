@@ -1,19 +1,19 @@
-def hamming_encode(data_bits: str) -> str:
-    m = len(data_bits)
-    # 1) Calcula r
-    r = 0
-    while (2 ** r) < (m + r + 1):
-        r += 1
-    n = m + r
-    # 2) Arreglo 1‑indexed
+def _hamming_encode_block(data_bits: str) -> str:
+    """
+    Extendido Hamming(12,8): para m=8 calcula r=4 y devuelve 12 bits.
+    """
+    # pre: len(data_bits)==8
+    m = 8
+    r = 4
+    n = m + r  # 12
     code = ['0'] * (n + 1)
-    # 3) Inserta datos
+    # coloca datos en posiciones no potencias de 2
     j = 0
     for i in range(1, n + 1):
-        if (i & (i - 1)) != 0:
+        if (i & (i-1)) != 0:
             code[i] = data_bits[j]
             j += 1
-    # 4) Calcula bits de paridad
+    # calcula bits de paridad en posiciones 1,2,4,8
     for i in range(r):
         parity_pos = 2 ** i
         parity = 0
@@ -22,3 +22,11 @@ def hamming_encode(data_bits: str) -> str:
                 parity ^= int(code[k])
         code[parity_pos] = str(parity)
     return ''.join(code[1:])
+
+
+def hamming_encode_message(bits: str) -> str:
+    """
+    Divide en bloques de 8 bits y aplica _hamming_encode_block a cada uno.
+    """
+    bloques = [bits[i:i+8] for i in range(0, len(bits), 8)]
+    return "".join(_hamming_encode_block(b) for b in bloques)
