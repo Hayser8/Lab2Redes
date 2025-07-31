@@ -1,126 +1,200 @@
 import subprocess
 import socket
 import time
-import random
 import os
+import random
 
 import numpy as np
 import matplotlib.pyplot as plt
 
-# --- Hamming(12,8) helpers (igual que antes) ---
+from presentation import codificar_mensaje
+from enlace import hamming_encode_message
+from ruido import aplicar_ruido
 
-def codificar_mensaje(texto: str) -> str:
-    return "".join(f"{ord(c):08b}" for c in texto)
+# ——— Protección por Paridad Simple ———
+def encode_parity(bits: str) -> str:
+    """Añade un bit de paridad par al final."""
+    parity = bits.count('1') % 2
+    return bits + str(parity)
 
-def _hamming_encode_block(data_bits: str) -> str:
-    m, r = 8, 4
-    n = m + r
-    code = ['0'] * (n + 1)
-    j = 0
-    for i in range(1, n + 1):
-        if (i & (i-1)) != 0:
-            code[i] = data_bits[j]
-            j += 1
+def decode_parity(trama: str):
+    """Devuelve (datos, correcto:bool) tras verificar paridad."""
+    data, p = trama[:-1], trama[-1]
+    ok = (data.count('1') % 2) == int(p)
+    return data, ok
+
+# ——— Hamming decode local para métricas ———
+def _hamming_decode_block(c: str):
+    n, r = 12, 4
+    err = 0
     for i in range(r):
-        parity_pos = 2 ** i
-        parity = 0
-        for k in range(1, n + 1):
-            if (k & parity_pos) != 0 and k != parity_pos:
-                parity ^= int(code[k])
-        code[parity_pos] = str(parity)
-    return ''.join(code[1:])
+        p = 2**i; total = 0; j = p-1
+        while j < n:
+            total += c[j:j+p].count('1')
+            j += 2*p
+        if total % 2: err += p
+    arr = list(c); corr = 0
+    if 1 <= err <= n:
+        idx = err-1
+        arr[idx] = '1' if arr[idx]=='0' else '0'
+        corr = 1
+    data = "".join(arr[i] for i in range(n) if ((i+1)&i)!=0)
+    diff = sum(a!=b for a,b in zip(c, ''.join(arr)))
+    uncorr = 1 if diff>corr else 0
+    return data, corr, uncorr
 
-def hamming_encode_message(bits: str) -> str:
-    bloques = [bits[i:i+8] for i in range(0, len(bits), 8)]
-    return "".join(_hamming_encode_block(b) for b in bloques)
+def hamming_decode(bits: str):
+    bloques = [bits[i:i+12] for i in range(0, len(bits), 12)]
+    data=""; tot_corr=tot_unc=0
+    for b in bloques:
+        d,c,u = _hamming_decode_block(b)
+        data+=d; tot_corr+=c; tot_unc+=u
+    return data, tot_corr, tot_unc
 
-def aplicar_ruido(bits: str, tasa_error: float) -> str:
-    return ''.join(
-        ('1' if b=='0' else '0') if random.random() < tasa_error else b
-        for b in bits
-    )
-
-# --- Orquestación integrada ---
-
+# ——— Orquestación Node.js ———
 def start_receptor_node(port: int):
-    """
-    Arranca receptor.js como servidor Node en segundo plano,
-    apuntando a la carpeta receptor/ donde está el script.
-    """
-    # Ruta absoluta al receptor.js
     script_dir = os.path.dirname(os.path.abspath(__file__))
     receptor_script = os.path.join(script_dir, "receptor", "receptor.js")
-
     proc = subprocess.Popen(
         ["node", receptor_script, str(port)],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        encoding='utf-8',
-        errors='ignore'
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, encoding='utf-8', errors='ignore'
     )
-    # Espera a la línea de arranque
     while True:
         line = proc.stdout.readline()
         if not line:
-            raise RuntimeError("El receptor no arrancó correctamente.")
-        if f"Receptor escuchando en puerto {port}" in line:
+            raise RuntimeError("El receptor no arrancó.")
+        if "escuchando" in line.lower():
             break
     return proc
 
 def send_trama(trama: str, host: str, port: int):
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+    with socket.socket() as s:
         s.connect((host, port))
-        s.sendall(trama.encode("utf-8"))
+        s.sendall(trama.encode())
         time.sleep(0.01)
 
-def test_noise_levels_integrated(message: str, noise_levels, trials: int, host: str, port: int):
-    receptor_proc = start_receptor_node(port)
+def receive_decoded(proc):
+    decoded = None
+    while True:
+        line = proc.stdout.readline()
+        if not line: break
+        if line.strip().startswith("---- MENSAJE DECODIFICADO"):
+            decoded = proc.stdout.readline().strip()
+            break
+    return decoded
+
+# ——— Métricas ———
+def metric_success_vs_length(lengths, ber, trials):
+    rates = []
+    for L in lengths:
+        succ = 0
+        for _ in range(trials):
+            msg = "A"*L
+            bits = codificar_mensaje(msg)
+            enc = hamming_encode_message(bits)
+            noisy = aplicar_ruido(enc, ber)
+            dec_bits, _, _ = hamming_decode(noisy)
+            rec = "".join(chr(int(dec_bits[i:i+8],2)) for i in range(0,len(dec_bits),8))
+            if rec == msg: succ += 1
+        rates.append(succ/trials)
+    return rates
+
+def metric_corrections_vs_ber(noise_levels, trials):
+    avg = []
+    for p in noise_levels:
+        csum=0; blocks=0
+        for _ in range(trials):
+            bits = codificar_mensaje("A"*20)
+            enc = hamming_encode_message(bits)
+            noisy = aplicar_ruido(enc, p)
+            _, c, _ = hamming_decode(noisy)
+            csum += c
+            blocks += len(bits)//8
+        avg.append(csum/blocks)
+    return avg
+
+def metric_per_vs_ber(noise_levels):
+    return [1 - ((1-p)**12 + 12*p*(1-p)**11) for p in noise_levels]
+
+def metric_compare_schemes(noise_levels, msg, trials):
+    bits = codificar_mensaje(msg)
+    raw = []; par = []; ham = []
+    for p in noise_levels:
+        sr=sp=sh=0
+        for _ in range(trials):
+            # Raw
+            if aplicar_ruido(bits,p) == bits: sr += 1
+            # Parity
+            encp = encode_parity(bits)
+            dp, ok = decode_parity(aplicar_ruido(encp,p))
+            if ok and "".join(chr(int(dp[i:i+8],2)) for i in range(0,len(dp),8))==msg: sp+=1
+            # Hamming
+            enh = hamming_encode_message(bits)
+            dh, _, _ = hamming_decode(aplicar_ruido(enh,p))
+            if "".join(chr(int(dh[i:i+8],2)) for i in range(0,len(dh),8))==msg: sh+=1
+        raw.append(sr/trials); par.append(sp/trials); ham.append(sh/trials)
+    return {"Raw":raw, "Parity":par, "Hamming":ham}
+
+def metric_latency_vs_ber(noise_levels):
+    return [1/((1-p)**12 + 12*p*(1-p)**11) for p in noise_levels]
+
+def metric_integrated(message, noise_levels, trials, host, port):
+    proc = start_receptor_node(port)
     time.sleep(0.1)
-
-    bits = codificar_mensaje(message)
-    enc = hamming_encode_message(bits)
-
-    success_rates = []
+    rates = []
     for p in noise_levels:
         succ = 0
         for _ in range(trials):
+            bits = codificar_mensaje(message)
+            enc = hamming_encode_message(bits)
             noisy = aplicar_ruido(enc, p)
             send_trama(noisy, host, port)
-
-            decoded = None
-            # Leer hasta encontrar la etiqueta de mensaje
-            while True:
-                out = receptor_proc.stdout.readline()
-                if not out:
-                    break
-                if out.strip().startswith("---- MENSAJE DECODIFICADO"):
-                    decoded = receptor_proc.stdout.readline().strip()
-                    break
-
-            if decoded == message:
+            if receive_decoded(proc) == message:
                 succ += 1
+        rates.append(succ/trials)
+    proc.terminate()
+    return rates
 
-        rate = succ / trials
-        print(f"Ruido {p:.3f}: {rate*100:.1f}% éxito")
-        success_rates.append(rate)
-
-    receptor_proc.terminate()
-    return success_rates
-
+# ——— Main y Plots ———
 if __name__ == "__main__":
-    HOST = "localhost"
-    PORT = 5001
-    MESSAGE = "hola como estas"
-    NOISE_LEVELS = np.arange(0, 0.101, 0.005)   # 0% a 10% en pasos de 0.5%
-    TRIALS = 200
+    HOST, PORT = "localhost", 5001
+    MESSAGE    = "hola como estas"
+    LENGTHS    = [5, 10, 20, 50]
+    BERS_FIXED = [0.01, 0.05, 0.10]
+    NOISE_L    = np.arange(0, 0.101, 0.005)
+    TRIALS     = 200
 
-    rates = test_noise_levels_integrated(MESSAGE, NOISE_LEVELS, TRIALS, HOST, PORT)
+    # 0) Integrado
+    r0 = metric_integrated(MESSAGE, NOISE_L, TRIALS, HOST, PORT)
+    plt.figure(); plt.plot(NOISE_L*100, r0, 'o-')
+    plt.title("Integrado: Éxito vs BER"); plt.xlabel("BER (%)"); plt.ylabel("Frac."); plt.grid(True); plt.show()
 
-    plt.plot(NOISE_LEVELS * 100, rates, marker="o")
-    plt.title("Éxito de decodificación vs nivel de ruido\n(Integrado Python ↔ Node.js)")
-    plt.xlabel("Nivel de ruido (BER %)")
-    plt.ylabel("Fracción de mensajes correctos")
-    plt.grid(True)
-    plt.tight_layout()
-    plt.show()
+    # 1) Éxito vs Longitud
+    plt.figure()
+    for ber in BERS_FIXED:
+        r1 = metric_success_vs_length(LENGTHS, ber, TRIALS)
+        plt.plot(LENGTHS, r1, 'o-', label=f'{ber*100:.0f}%')
+    plt.title("Éxito vs Longitud"); plt.xlabel("Len"); plt.ylabel("Frac."); plt.legend(); plt.grid(True); plt.show()
+
+    # 2) Correcciones vs BER
+    r2 = metric_corrections_vs_ber(NOISE_L, TRIALS)
+    plt.figure(); plt.plot(NOISE_L*100, r2, 'o-')
+    plt.title("Correcciones/bloque vs BER"); plt.xlabel("BER (%)"); plt.ylabel("Promedio"); plt.grid(True); plt.show()
+
+    # 3) PER vs BER
+    r3 = metric_per_vs_ber(NOISE_L)
+    plt.figure(); plt.plot(NOISE_L*100, r3, 'o-')
+    plt.title("PER vs BER"); plt.xlabel("BER (%)"); plt.ylabel("PER"); plt.grid(True); plt.show()
+
+    # 4) Comparativa esquemas
+    cmp = metric_compare_schemes(NOISE_L, "A"*15, TRIALS)
+    plt.figure()
+    for k,v in cmp.items():
+        plt.plot(NOISE_L*100, v, 'o-', label=k)
+    plt.title("Comparativa"); plt.xlabel("BER (%)"); plt.ylabel("Frac."); plt.legend(); plt.grid(True); plt.show()
+
+    # 5) Retransmisiones vs BER
+    r5 = metric_latency_vs_ber(NOISE_L)
+    plt.figure(); plt.plot(NOISE_L*100, r5, 'o-')
+    plt.title("Tx promedio vs BER"); plt.xlabel("BER (%)"); plt.ylabel("Tx"); plt.grid(True); plt.show()
